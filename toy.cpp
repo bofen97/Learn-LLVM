@@ -14,7 +14,7 @@
 #include "llvm/IR/Function.h"
 #include "llvm/IR/IRBuilder.h"
 #include "llvm/IR/LLVMContext.h"
-// #include "llvm/IR/Module.h"
+#include "llvm/IR/Module.h"
 #include "llvm/IR/Type.h"
 #include "llvm/IR/Verifier.h"
 using namespace llvm;
@@ -175,7 +175,7 @@ public:
             
         case '<':
             L = Builder->CreateFCmpULT(L,R,"cmptmp");
-            //debug
+            //[bug] CH3 "TheContext" fix to -> "*TheContext" 
             return Builder->CreateUIToFP(L, Type::getDoubleTy(*TheContext),
                                  "booltmp");
         default:
