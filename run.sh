@@ -1,8 +1,8 @@
 #!/bin/bash
 
 # Set the C and C++ compilers
-export CMAKE_C_COMPILER=clang
-export CMAKE_CXX_COMPILER=clang++
+# export CMAKE_C_COMPILER=clang
+# export CMAKE_CXX_COMPILER=clang++
 
 # Change to the project directory (replace with your actual project directory)
 cd ./build
@@ -17,7 +17,8 @@ else
 fi
 
 # Generate Ninja build files
-cmake -GNinja ..
+# cmake -GNinja ..
+cmake -GNinja -DCMAKE_C_COMPILER=clang -DCMAKE_CXX_COMPILER=clang++ ..
 
 # Build the project
 ninja
