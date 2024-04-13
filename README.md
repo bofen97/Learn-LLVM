@@ -12,6 +12,46 @@ chmod +x run.sh
 ./run.sh
 ```
 
+##### ch4 outputs (Duplication of symbols in separate modules is not allowed since LLVM-9.)
+```
+Found LLVM 17.0.1, build type Release
+-- Configuring done (0.2s)
+-- Generating done (0.0s)
+-- Build files have been written to: /Users/bofeng/Learn-LLVM/build
+[1/1] Linking CXX executable toy
+ready> extern sin(x);
+ready> Read extern: declare double @sin(double)
+
+ready> extern cos(x);
+ready> Read extern: declare double @cos(double)
+
+ready> sin(1.0);
+ready> Evaluated to 0.841471
+ready> cos(1.0);
+ready> Evaluated to 0.540302
+ready> def foo(x) sin(x)*sin(x) + cos(x)*cos(x);
+ready> Read function definition:define double @foo(double %x) {
+entry:
+  %calltmp = call double @sin(double %x)
+  %calltmp1 = call double @sin(double %x)
+  %multmp = fmul double %calltmp, %calltmp1
+  %calltmp2 = call double @cos(double %x)
+  %calltmp3 = call double @cos(double %x)
+  %multmp4 = fmul double %calltmp2, %calltmp3
+  %addtmp = fadd double %multmp, %multmp4
+  ret double %addtmp
+}
+
+ready> foo(4.0);
+ready> Evaluated to 1.000000
+ready> extern printd(x);
+ready> Read extern: declare double @printd(double)
+
+ready> printd(1);
+ready> 1.000000
+Evaluated to 0.000000
+ready> 
+```
 ##### ch3 outputs（Ch3 has been completed and there are no APIs that need to be modified. A spelling error was found.）
 ```
 ready> def foo(a b) a*a + 2*a*b + b*b;
