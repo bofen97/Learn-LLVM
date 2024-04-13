@@ -26,7 +26,9 @@
 #include "llvm/Transforms/Scalar/GVN.h"
 #include "llvm/Transforms/Scalar/Reassociate.h"
 #include "llvm/Transforms/Scalar/SimplifyCFG.h"
+#include "jit.h"
 using namespace llvm;
+using namespace llvm::orc;
 
 //===----------------------------------------------------------------------===//
 // Lexer
@@ -117,13 +119,15 @@ static std::unique_ptr<CGSCCAnalysisManager> TheCGAM;
 static std::unique_ptr<ModuleAnalysisManager> TheMAM;
 static std::unique_ptr<PassInstrumentationCallbacks> ThePIC;
 static std::unique_ptr<StandardInstrumentations> TheSI;
+static std::unique_ptr<KaleidoscopeJIT> TheJIT;
+static ExitOnError ExitOnErr;
 
-
-static void InitializeModule(){
+static void InitializeModuleAndPassManager(){
 
 
     TheContext= std::make_unique<LLVMContext>();
     TheModule = std::make_unique<Module>("my cool jit", *TheContext);
+    TheModule->setDataLayout(TheJIT->getDataLayout());
     Builder = std::make_unique<IRBuilder<>>(*TheContext);
 
 
@@ -588,13 +592,26 @@ static void HandleExtern() {
 static void HandleTopLevelExpression() {
   // Evaluate a top-level expression into an anonymous function.
   if (auto FnAST = ParseTopLevelExpr()) {
-    if (auto *FnIR = FnAST->codegen()) {
-      fprintf(stderr, "Read top-level expression:");
-      FnIR->print(errs());
-      fprintf(stderr, "\n");
+    if (FnAST->codegen()) {
 
-      // Remove the anonymous expression.
-      FnIR->eraseFromParent();
+      auto RT = TheJIT->getMainJITDylib().createResourceTracker();
+
+      auto TSM = ThreadSafeModule(std::move(TheModule), std::move(TheContext));
+      ExitOnErr(TheJIT->addModule(std::move(TSM), RT));
+      InitializeModuleAndPassManager();
+
+      // Search the JIT for the __anon_expr symbol.
+      auto ExprSymbol = ExitOnErr(TheJIT->lookup("__anon_expr"));
+      // assert(ExprSymbol && "Function not found");
+      
+      // Get the symbol's address and cast it to the right type (takes no
+      // arguments, returns a double) so we can call it as a native function.
+      double (*FP)() = ExprSymbol.getAddress().toPtr<double (*)()>();
+      fprintf(stderr, "Evaluated to %f\n", FP());
+
+      // Delete the anonymous expression module from the JIT.
+      ExitOnErr(RT->remove());
+      
     }
   } else {
     // Skip token for error recovery.
@@ -630,6 +647,10 @@ static void MainLoop() {
 //===----------------------------------------------------------------------===//
 
 int main() {
+  InitializeNativeTarget();
+  InitializeNativeTargetAsmPrinter();
+  InitializeNativeTargetAsmParser();
+
   // Install standard binary operators.
   // 1 is lowest precedence.
   BinopPrecedence['<'] = 10;
@@ -640,11 +661,9 @@ int main() {
   // Prime the first token.
   fprintf(stderr, "ready> ");
   getNextToken();
-    InitializeModule();
-
-
+  TheJIT = ExitOnErr(KaleidoscopeJIT::Create());
+  InitializeModuleAndPassManager();
   // Run the main "interpreter loop" now.
   MainLoop();
-TheModule->print(errs(), nullptr);
   return 0;
 }
