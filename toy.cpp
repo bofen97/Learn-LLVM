@@ -1,11 +1,4 @@
-#include <cctype>
-#include <cstdio>
-#include <cstdlib>
-#include <map>
-#include <memory>
-#include <string>
-#include <utility>
-#include <vector>
+#include "jit.h"
 #include "llvm/ADT/APFloat.h"
 #include "llvm/ADT/STLExtras.h"
 #include "llvm/IR/BasicBlock.h"
@@ -15,9 +8,32 @@
 #include "llvm/IR/IRBuilder.h"
 #include "llvm/IR/LLVMContext.h"
 #include "llvm/IR/Module.h"
+#include "llvm/IR/PassManager.h"
 #include "llvm/IR/Type.h"
 #include "llvm/IR/Verifier.h"
+#include "llvm/Passes/PassBuilder.h"
+#include "llvm/Passes/StandardInstrumentations.h"
+#include "llvm/Support/TargetSelect.h"
+#include "llvm/Target/TargetMachine.h"
+#include "llvm/Transforms/InstCombine/InstCombine.h"
+#include "llvm/Transforms/Scalar.h"
+#include "llvm/Transforms/Scalar/GVN.h"
+#include "llvm/Transforms/Scalar/Reassociate.h"
+#include "llvm/Transforms/Scalar/SimplifyCFG.h"
+#include <algorithm>
+#include <cassert>
+#include <cctype>
+#include <cstdint>
+#include <cstdio>
+#include <cstdlib>
+#include <map>
+#include <memory>
+#include <string>
+#include <vector>
+
 using namespace llvm;
+using namespace llvm::orc;
+
 
 //===----------------------------------------------------------------------===//
 // Lexer
@@ -96,20 +112,54 @@ Value *LogErrorV(const char *Str);
 // Abstract Syntax Tree (aka Parse Tree)
 //===----------------------------------------------------------------------===//
 namespace {
-
 static std::unique_ptr<LLVMContext> TheContext;
 static std::unique_ptr<Module> TheModule;
 static std::unique_ptr<IRBuilder<>> Builder;
 static std::map<std::string, Value *> NamedValues;
+static std::unique_ptr<FunctionPassManager> TheFPM;
+static std::unique_ptr<LoopAnalysisManager> TheLAM;
+static std::unique_ptr<FunctionAnalysisManager> TheFAM;
+static std::unique_ptr<CGSCCAnalysisManager> TheCGAM;
+static std::unique_ptr<ModuleAnalysisManager> TheMAM;
+static std::unique_ptr<PassInstrumentationCallbacks> ThePIC;
+static std::unique_ptr<StandardInstrumentations> TheSI;
+static std::unique_ptr<KaleidoscopeJIT> TheJIT;
+static ExitOnError ExitOnErr;
 
 
-
-static void InitializeModule(){
+static void InitializeModuleAndPassManager(){
 
 
     TheContext= std::make_unique<LLVMContext>();
     TheModule = std::make_unique<Module>("my cool jit", *TheContext);
+    TheModule->setDataLayout(TheJIT->getDataLayout());
     Builder = std::make_unique<IRBuilder<>>(*TheContext);
+
+
+    // Create new pass and analysis managers.
+    TheFPM = std::make_unique<FunctionPassManager>();
+    TheLAM = std::make_unique<LoopAnalysisManager>();
+    TheFAM = std::make_unique<FunctionAnalysisManager>();
+    TheCGAM = std::make_unique<CGSCCAnalysisManager>();
+    TheMAM = std::make_unique<ModuleAnalysisManager>();
+    ThePIC = std::make_unique<PassInstrumentationCallbacks>();
+    TheSI = std::make_unique<StandardInstrumentations>(*TheContext,
+                                                      /*DebugLogging*/ true);
+    TheSI->registerCallbacks(*ThePIC, TheMAM.get());
+    // Add transform passes.
+    // Do simple "peephole" optimizations and bit-twiddling optzns.
+    TheFPM->addPass(InstCombinePass());
+    // Reassociate expressions.
+    TheFPM->addPass(ReassociatePass());
+    // Eliminate Common SubExpressions.
+    TheFPM->addPass(GVNPass());
+    // Simplify the control flow graph (deleting unreachable blocks, etc).
+    TheFPM->addPass(SimplifyCFGPass());
+    
+    PassBuilder PB;
+    PB.registerModuleAnalyses(*TheMAM);
+    PB.registerFunctionAnalyses(*TheFAM);
+    PB.crossRegisterProxies(*TheLAM, *TheFAM, *TheCGAM, *TheMAM);
 
 }
 /// ExprAST - Base class for all expression nodes.
@@ -195,24 +245,8 @@ public:
               std::vector<std::unique_ptr<ExprAST>> Args)
       : Callee(Callee), Args(std::move(Args)) {}
 
-      Value* codegen() override {
-    //Look up the specified function in the module symbol table. If it does not
-    // exist, return null.
-        Function *CalleeF = TheModule->getFunction(Callee);
-        if (!CalleeF)
-            return LogErrorV("Unknown function referenced");
-        if (CalleeF->arg_size() != Args.size())
-            return LogErrorV("Incorrect # arguments passed");
-
-
-        std::vector<Value*>ArgsV;
-        for(unsigned i=0,e = Args.size();i!=e;++i){
-            ArgsV.push_back(Args[i]->codegen());
-            if(!Args.back())
-                return nullptr;
-        }
-        return Builder->CreateCall(CalleeF, ArgsV, "calltmp");
-      }
+    Value* codegen() ;
+      
 };
 
 /// PrototypeAST - This class represents the "prototype" for a function,
@@ -247,6 +281,41 @@ public:
     }
 
 };
+static std::map<std::string, std::unique_ptr<PrototypeAST>> FunctionProtos;
+Function *getFunction(std::string Name) {
+  // First, see if the function has already been added to the current module.
+  if (auto *F = TheModule->getFunction(Name))
+    return F;
+
+  // If not, check whether we can codegen the declaration from some existing
+  // prototype.
+  auto FI = FunctionProtos.find(Name);
+  if (FI != FunctionProtos.end())
+    return FI->second->codegen();
+
+  // If no existing prototype exists, return null.
+  return nullptr;
+}
+
+Value* CallExprAST::codegen()  {
+    //Look up the specified function in the module symbol table. If it does not
+    // exist, return null.
+        // Function *CalleeF = TheModule->getFunction(Callee);
+        Function *CalleeF = getFunction(Callee);
+        if (!CalleeF)
+            return LogErrorV("Unknown function referenced");
+        if (CalleeF->arg_size() != Args.size())
+            return LogErrorV("Incorrect # arguments passed");
+
+
+        std::vector<Value*>ArgsV;
+        for(unsigned i=0,e = Args.size();i!=e;++i){
+            ArgsV.push_back(Args[i]->codegen());
+            if(!Args.back())
+                return nullptr;
+        }
+        return Builder->CreateCall(CalleeF, ArgsV, "calltmp");
+}
 
 /// FunctionAST - This class represents a function definition itself.
 class FunctionAST {
@@ -259,11 +328,14 @@ public:
       : Proto(std::move(Proto)), Body(std::move(Body)) {}
 
       Function* codegen() {
-
-        Function* TheFunction = TheModule->getFunction(Proto->getName());
-        if(!TheFunction){
-            TheFunction = Proto->codegen();
-        }
+        auto &P = *Proto;
+        FunctionProtos[Proto->getName()] = std::move(Proto);
+        Function *TheFunction = getFunction(P.getName());
+        
+        // Function* TheFunction = TheModule->getFunction(Proto->getName());
+        // if(!TheFunction){
+        //     TheFunction = Proto->codegen();
+        // }
         if (!TheFunction)
             return nullptr;
         if (!TheFunction->empty())
@@ -281,6 +353,8 @@ public:
 
             // Validate the generated code, checking for consistency.
             verifyFunction(*TheFunction);
+
+            TheFPM->run(*TheFunction,*TheFAM);
 
             return TheFunction;
         }  
@@ -521,6 +595,9 @@ static void HandleDefinition() {
       fprintf(stderr, "Read function definition:");
       FnIR->print(errs());
       fprintf(stderr, "\n");
+      ExitOnErr(TheJIT->addModule(
+          ThreadSafeModule(std::move(TheModule), std::move(TheContext))));
+      InitializeModuleAndPassManager();
     }
   } else {
     // Skip token for error recovery.
@@ -535,6 +612,7 @@ static void HandleExtern() {
       fprintf(stderr, "Read extern: ");
       FnIR->print(errs());
       fprintf(stderr, "\n");
+      FunctionProtos[ProtoAST->getName()] = std::move(ProtoAST);
     }
   } else {
     // Skip token for error recovery.
@@ -545,13 +623,26 @@ static void HandleExtern() {
 static void HandleTopLevelExpression() {
   // Evaluate a top-level expression into an anonymous function.
   if (auto FnAST = ParseTopLevelExpr()) {
-    if (auto *FnIR = FnAST->codegen()) {
-      fprintf(stderr, "Read top-level expression:");
-      FnIR->print(errs());
-      fprintf(stderr, "\n");
+    if (FnAST->codegen()) {
 
-      // Remove the anonymous expression.
-      FnIR->eraseFromParent();
+      auto RT = TheJIT->getMainJITDylib().createResourceTracker();
+
+      auto TSM = ThreadSafeModule(std::move(TheModule), std::move(TheContext));
+      ExitOnErr(TheJIT->addModule(std::move(TSM), RT));
+      InitializeModuleAndPassManager();
+
+      // Search the JIT for the __anon_expr symbol.
+      auto ExprSymbol = ExitOnErr(TheJIT->lookup("__anon_expr"));
+      // assert(ExprSymbol && "Function not found");
+      
+      // Get the symbol's address and cast it to the right type (takes no
+      // arguments, returns a double) so we can call it as a native function.
+      double (*FP)() = ExprSymbol.getAddress().toPtr<double (*)()>();
+      fprintf(stderr, "Evaluated to %f\n", FP());
+
+      // Delete the anonymous expression module from the JIT.
+      ExitOnErr(RT->remove());
+      
     }
   } else {
     // Skip token for error recovery.
@@ -582,11 +673,33 @@ static void MainLoop() {
   }
 }
 
+#ifdef _WIN32
+#define DLLEXPORT __declspec(dllexport)
+#else
+#define DLLEXPORT
+#endif
+
+/// putchard - putchar that takes a double and returns 0.
+extern "C" DLLEXPORT double putchard(double X) {
+  fputc((char)X, stderr);
+  return 0;
+}
+
+/// printd - printf that takes a double prints it as "%f\n", returning 0.
+extern "C" DLLEXPORT double printd(double X) {
+  fprintf(stderr, "%f\n", X);
+  return 0;
+}
+
 //===----------------------------------------------------------------------===//
 // Main driver code.
 //===----------------------------------------------------------------------===//
 
 int main() {
+  InitializeNativeTarget();
+  InitializeNativeTargetAsmPrinter();
+  InitializeNativeTargetAsmParser();
+
   // Install standard binary operators.
   // 1 is lowest precedence.
   BinopPrecedence['<'] = 10;
@@ -597,11 +710,9 @@ int main() {
   // Prime the first token.
   fprintf(stderr, "ready> ");
   getNextToken();
-    InitializeModule();
-
-
+  TheJIT = ExitOnErr(KaleidoscopeJIT::Create());
+  InitializeModuleAndPassManager();
   // Run the main "interpreter loop" now.
   MainLoop();
-TheModule->print(errs(), nullptr);
   return 0;
 }

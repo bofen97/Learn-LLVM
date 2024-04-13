@@ -11,7 +11,7 @@ include(ChooseMSVCCRT)
 separate_arguments(LLVM_DEFINITIONS_LIST NATIVE_COMMAND ${LLVM_DEFINITIONS})
 add_definitions(${LLVM_DEFINITIONS_LIST})
 include_directories(SYSTEM ${LLVM_INCLUDE_DIRS})
-llvm_map_components_to_libnames(llvm_libs Core)
+llvm_map_components_to_libnames(llvm_libs Core orcjit native )
 
 if(LLVM_COMPILER_IS_GCC_COMPATIBLE)
   if(NOT LLVM_ENABLE_RTTI)
@@ -22,8 +22,9 @@ if(LLVM_COMPILER_IS_GCC_COMPATIBLE)
   endif()
 endif()
 
-
+# add_library(mylib SHARED hello_pass.cpp)
+# target_link_libraries(mylib PRIVATE ${llvm_libs})
 add_executable (toy
   toy.cpp
-  )
+)
 target_link_libraries(toy PRIVATE ${llvm_libs})
