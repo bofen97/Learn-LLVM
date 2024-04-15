@@ -12,6 +12,34 @@ chmod +x run.sh
 ./run.sh
 ```
 
+##### ch5 completed
+```
+ready> extern putchard(char);
+def printstar(n)
+  for i = ready> Read extern: declare double @putchard(double)
+
+ready> ready> 1, i < n, 1.0 in
+    putchard(42);
+Read function definition:define double @printstar(double %n) {
+entry:
+  br label %loop
+
+loop:                                             ; preds = %loop, %entry
+  %i = phi double [ 1.000000e+00, %entry ], [ %nextvar, %loop ]
+  %calltmp = call double @putchard(double 4.200000e+01)
+  %nextvar = fadd double %i, 1.000000e+00
+  %cmptmp = fcmp ult double %i, %n
+  br i1 %cmptmp, label %loop, label %afterloop
+
+afterloop:                                        ; preds = %loop
+  ret double 0.000000e+00
+}
+
+ready> printstar(100);
+ready> ****************************************************************************************************Evaluated to 0.000000
+ready> 
+```
+
 ##### ch4 outputs (Duplication of symbols in separate modules is not allowed since LLVM-9.)
 ```
 Found LLVM 17.0.1, build type Release
