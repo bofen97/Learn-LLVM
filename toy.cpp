@@ -417,7 +417,29 @@ public:
   return Constant::getNullValue(Type::getDoubleTy(*TheContext));
   }
 };
+class UnaryExprAST : public ExprAST {
+  char Opcode;
+  std::unique_ptr<ExprAST> Operand;
 
+public:
+  UnaryExprAST(char Opcode, std::unique_ptr<ExprAST> Operand)
+    : Opcode(Opcode), Operand(std::move(Operand)) {}
+
+  Value *codegen() override{
+
+    Value *OperandV = Operand->codegen();
+  if (!OperandV)
+    return nullptr;
+
+  Function *F = getFunction(std::string("unary") + Opcode);
+  if (!F)
+    return LogErrorV("Unknown unary operator");
+
+  return Builder->CreateCall(F, OperandV, "unop");
+
+
+  }
+};
 /// PrototypeAST - This class represents the "prototype" for a function,
 /// which captures its name, and its argument names (thus implicitly the number
 /// of arguments the function takes).
@@ -436,7 +458,6 @@ public:
 
   bool isUnaryOp() const { return IsOperator && Args.size() == 1; }
   bool isBinaryOp() const { return IsOperator && Args.size() == 2; }
-  //TODO
   char getOperatorName() const {
     assert(isUnaryOp() || isBinaryOp());
     return Name[Name.size() - 1];
@@ -672,6 +693,7 @@ static std::unique_ptr<ExprAST> ParsePrimary() {
     return ParseForExpr();
   }
 }
+static std::unique_ptr<ExprAST> ParseUnary();
 
 /// binoprhs
 ///   ::= ('+' primary)*
@@ -691,7 +713,7 @@ static std::unique_ptr<ExprAST> ParseBinOpRHS(int ExprPrec,
     getNextToken(); // eat binop
 
     // Parse the primary expression after the binary operator.
-    auto RHS = ParsePrimary();
+    auto RHS = ParseUnary();
     if (!RHS)
       return nullptr;
 
@@ -709,12 +731,11 @@ static std::unique_ptr<ExprAST> ParseBinOpRHS(int ExprPrec,
         std::make_unique<BinaryExprAST>(BinOp, std::move(LHS), std::move(RHS));
   }
 }
-
 /// expression
 ///   ::= primary binoprhs
 ///
 static std::unique_ptr<ExprAST> ParseExpression() {
-  auto LHS = ParsePrimary();
+  auto LHS = ParseUnary();
   if (!LHS)
     return nullptr;
 
@@ -738,6 +759,15 @@ static std::unique_ptr<PrototypeAST> ParsePrototype() {
             Kind = 0;
             getNextToken();
             break;
+    case tok_unary:
+            getNextToken();
+            if (!isascii(CurTok))
+              return LogErrorP("Expected unary operator");
+            FnName = "unary";
+            FnName += (char)CurTok;
+            Kind = 1;
+            getNextToken();
+            break;
   case tok_binary:
       getNextToken();
       if (!isascii(CurTok))
@@ -754,7 +784,6 @@ static std::unique_ptr<PrototypeAST> ParsePrototype() {
       }
       break;
   }
-
 
 
 
@@ -784,6 +813,22 @@ static std::unique_ptr<PrototypeAST> ParsePrototype() {
   return std::make_unique<PrototypeAST>(FnName, std::move(ArgNames), Kind != 0,
                                          BinaryPrecedence);
   // return std::make_unique<PrototypeAST>(FnName, std::move(ArgNames));
+}
+
+/// unary
+///   ::= primary
+///   ::= '!' unary
+static std::unique_ptr<ExprAST> ParseUnary() {
+  // If the current token is not an operator, it must be a primary expr.
+  if (!isascii(CurTok) || CurTok == '(' || CurTok == ',')
+    return ParsePrimary();
+
+  // If this is a unary operator, read it.
+  int Opc = CurTok;
+  getNextToken();
+  if (auto Operand = ParseUnary())
+    return std::make_unique<UnaryExprAST>(Opc, std::move(Operand));
+  return nullptr;
 }
 
 /// definition ::= 'def' prototype expression
