@@ -1073,9 +1073,9 @@ static void HandleDefinition() {
       fprintf(stderr, "Read function definition:");
       FnIR->print(errs());
       fprintf(stderr, "\n");
-      ExitOnErr(TheJIT->addModule(
-          ThreadSafeModule(std::move(TheModule), std::move(TheContext))));
-      InitializeModuleAndPassManager();
+      // ExitOnErr(TheJIT->addModule(
+      //     ThreadSafeModule(std::move(TheModule), std::move(TheContext))));
+      // InitializeModuleAndPassManager();
     }
   } else {
     // Skip token for error recovery.
@@ -1172,7 +1172,10 @@ extern "C" DLLEXPORT double printd(double X) {
 //===----------------------------------------------------------------------===//
 // Main driver code.
 //===----------------------------------------------------------------------===//
-
+#include "llvm/MC/TargetRegistry.h"
+#include "llvm/TargetParser/Host.h"
+#include "llvm/IR/LegacyPassManager.h"
+using namespace llvm::sys;
 int main() {
   InitializeNativeTarget();
   InitializeNativeTargetAsmPrinter();
@@ -1187,6 +1190,30 @@ int main() {
   BinopPrecedence['-'] = 20;
   BinopPrecedence['*'] = 40; // highest.
 
+  auto TargetTriple = sys::getDefaultTargetTriple();
+  std::string Error;
+  auto Target = TargetRegistry::lookupTarget(TargetTriple, Error);
+
+  // Print an error and exit if we couldn't find the requested target.
+  // This generally occurs if we've forgotten to initialise the
+  // TargetRegistry or we have a bogus target triple.
+  if (!Target) {
+    errs() << Error;
+    return 1;
+  }
+  auto CPU = "generic";
+  auto Features = "";
+  TargetOptions opt;
+  auto TargetMachine = Target->createTargetMachine(TargetTriple, CPU, Features, opt, Reloc::PIC_);
+  
+  auto Filename = "output.o";
+  std::error_code EC;
+  raw_fd_ostream dest(Filename, EC, sys::fs::OF_None);
+
+  if (EC) {
+    errs() << "Could not open file: " << EC.message();
+    return 1;
+  }
   // Prime the first token.
   fprintf(stderr, "ready> ");
   getNextToken();
@@ -1194,5 +1221,19 @@ int main() {
   InitializeModuleAndPassManager();
   // Run the main "interpreter loop" now.
   MainLoop();
+
+  legacy::PassManager pass;
+  auto FileType = CodeGenFileType::CGFT_ObjectFile;
+
+  if (TargetMachine->addPassesToEmitFile(pass, dest, nullptr, FileType)) {
+    errs() << "TargetMachine can't emit a file of this type";
+    return 1;
+  }
+
+  pass.run(*TheModule);
+  dest.flush();
+
+
+
   return 0;
 }

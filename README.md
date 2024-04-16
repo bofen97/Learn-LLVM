@@ -11,6 +11,34 @@ cd Learn-LLVM
 chmod +x run.sh
 ./run.sh
 ```
+##### ch8 completed
+There are some differences from the original Chapter 8 code. I only generated native code x86-64, retained the JIT's evaluation of top-level expressions, continued to use the JIT's layout, and commented out the HandleDefinition JIT part to generate the obj file.After getting output.obj, you can compile main.cpp with g++ or clang++ and link output.obj to generate an executable file.
+
+```
+ready> 1+1;
+ready> Evaluated to 2.000000
+ready> def average(x y) (x + y) * 0.5;
+ready> Read function definition:define double @average(double %x, double %y) {
+entry:
+  %addtmp = fadd double %x, %y
+  %multmp = fmul double %addtmp, 5.000000e-01
+  ret double %multmp
+}
+
+ready> ready> %                                                        
+Learn-LLVM % objdump -t build/output.o 
+
+build/output.o:     file format mach-o-x86-64
+
+SYMBOL TABLE:
+0000000000000000 g       0f SECT   01 0000 [.text] _average
+
+
+Learn-LLVM % g++ main.cpp ./build/output.o -o main && ./main
+average of 3.0 and 4.0: 3.5
+```
+
+
 ##### ch7 completed
 ```
 ready> extern printd(x);
