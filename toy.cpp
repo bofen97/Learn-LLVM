@@ -1,3 +1,4 @@
+// I am Binary psychedelic mushrooms
 #include "jit.h"
 #include "llvm/ADT/APFloat.h"
 #include "llvm/ADT/STLExtras.h"
@@ -57,7 +58,8 @@ enum Token {
   tok_for = -9,
   tok_in = -10,
   tok_binary = -11,
-  tok_unary = -12
+  tok_unary = -12,
+  tok_var = -13
 };
 
 static std::string IdentifierStr; // Filled in if tok_identifier
@@ -94,7 +96,8 @@ static int gettok() {
       return tok_binary;
     if (IdentifierStr == "unary")
       return tok_unary;
-    
+    if (IdentifierStr == "var")
+      return tok_var;
     return tok_identifier;
   }
 
@@ -137,7 +140,7 @@ namespace {
 static std::unique_ptr<LLVMContext> TheContext;
 static std::unique_ptr<Module> TheModule;
 static std::unique_ptr<IRBuilder<>> Builder;
-static std::map<std::string, Value *> NamedValues;
+static std::map<std::string, AllocaInst *> NamedValues;
 static std::unique_ptr<FunctionPassManager> TheFPM;
 static std::unique_ptr<LoopAnalysisManager> TheLAM;
 static std::unique_ptr<FunctionAnalysisManager> TheFAM;
@@ -148,6 +151,15 @@ static std::unique_ptr<StandardInstrumentations> TheSI;
 static std::unique_ptr<KaleidoscopeJIT> TheJIT;
 static ExitOnError ExitOnErr;
 
+/// CreateEntryBlockAlloca - Create an alloca instruction in the entry block of
+/// the function.  This is used for mutable variables etc.
+static AllocaInst *CreateEntryBlockAlloca(Function *TheFunction,
+                                           const std::string &VarName) {
+  IRBuilder<> TmpB(&TheFunction->getEntryBlock(),
+                 TheFunction->getEntryBlock().begin());
+  return TmpB.CreateAlloca(Type::getDoubleTy(*TheContext), nullptr,
+                           VarName);
+}
 
 static void InitializeModuleAndPassManager(){
 
@@ -207,13 +219,14 @@ class VariableExprAST : public ExprAST {
 
 public:
   VariableExprAST(const std::string &Name) : Name(Name) {}
+  const std::string &getName() const { return Name; }
  Value* codegen() override {
-    Value *V = NamedValues[Name];
-    if (!V)
+    AllocaInst *A = NamedValues[Name];
+    if (!A)
     {
         LogErrorV("Unknown variable name");
     }
-    return V;
+    return Builder->CreateLoad(A->getAllocatedType(), A, Name.c_str());
     
  }
 };
@@ -230,35 +243,50 @@ public:
       
       Value* codegen() override {
 
+        if (Op == '=') {
+          // Assignment requires the LHS to be an identifier.
+          // This assume we're building without RTTI because LLVM builds that way by
+          // default.  If you build LLVM with RTTI this can be changed to a
+          // dynamic_cast for automatic error checking.
+          VariableExprAST *LHSE = static_cast<VariableExprAST *>(LHS.get());
+          if (!LHSE)
+            return LogErrorV("destination of '=' must be a variable");
+          // Codegen the RHS.
+          Value *Val = RHS->codegen();
+          if (!Val)
+            return nullptr;
+
+          // Look up the name.
+          Value *Variable = NamedValues[LHSE->getName()];
+          if (!Variable)
+            return LogErrorV("Unknown variable name");
+
+          Builder->CreateStore(Val, Variable);
+          return Val;
+        }
         Value *L = LHS->codegen();
         Value *R = RHS->codegen();
         if (!L || !R)
-            return nullptr;
-        switch (Op)
-        {
-        case '+':
-            return Builder->CreateFAdd(L,R,"addtmp");
-            
-        case '-':
-            return Builder->CreateFSub(L,R,"subtmp");
-            
-        case '*':
-            return Builder->CreateFMul(L,R,"multmp");
-            
-        case '<':
-            L = Builder->CreateFCmpULT(L,R,"cmptmp");
-            //[bug] CH3 "TheContext" fix to -> "*TheContext" 
-            return Builder->CreateUIToFP(L, Type::getDoubleTy(*TheContext),
-                                 "booltmp");
-        default:
-            // return LogErrorV("invalid binary operator");
-            break;
+          return nullptr;
+        
+        switch (Op) {
+            case '+':
+              return Builder->CreateFAdd(L, R, "addtmp");
+            case '-':
+              return Builder->CreateFSub(L, R, "subtmp");
+            case '*':
+              return Builder->CreateFMul(L, R, "multmp");
+            case '<':
+              L = Builder->CreateFCmpULT(L, R, "cmptmp");
+              // Convert bool 0/1 to double 0.0 or 1.0
+              return Builder->CreateUIToFP(L, Type::getDoubleTy(*TheContext), "booltmp");
+            default:
+              break;
         }
-
         Function *F = getFunction(std::string("binary") + Op);
         assert(F && "binary operator not found!");
 
-        Value *Ops[2] = { L, R };
+        Value *Ops[] = {L, R};
         return Builder->CreateCall(F, Ops, "binop");
         
       }
@@ -345,76 +373,65 @@ public:
              std::unique_ptr<ExprAST> Body)
     : VarName(VarName), Start(std::move(Start)), End(std::move(End)),
       Step(std::move(Step)), Body(std::move(Body)) {}
-
   Value *codegen() override{
-
-    Value *StartVal = Start->codegen();
-    if(!StartVal){
-      return nullptr;
-    }
     Function *TheFunction = Builder->GetInsertBlock()->getParent();
-    BasicBlock *PreheaderBB = Builder->GetInsertBlock();
-    BasicBlock *LoopBB =
-        BasicBlock::Create(*TheContext, "loop", TheFunction);
 
-    // Insert an explicit fall through from the current block to the LoopBB.
+    // Create an alloca for the variable in the entry block.
+    AllocaInst *Alloca = CreateEntryBlockAlloca(TheFunction, VarName);
+
+    // Emit the start code first, without 'variable' in scope.
+    Value *StartVal = Start->codegen();
+    if (!StartVal)
+      return nullptr;
+    
+    Builder->CreateStore(StartVal,Alloca);
+    BasicBlock* LoopBB = BasicBlock::Create(*TheContext,"loop",TheFunction);
     Builder->CreateBr(LoopBB);
-
     Builder->SetInsertPoint(LoopBB);
-    // Start the PHI node with an entry for Start.
-    PHINode *Variable = Builder->CreatePHI(Type::getDoubleTy(*TheContext),
-                                       2, VarName);
-    Variable->addIncoming(StartVal, PreheaderBB);
 
-    // Within the loop, the variable is defined equal to the PHI node.  If it
-    // shadows an existing variable, we have to restore it, so save it now.
-    Value *OldVal = NamedValues[VarName];
-    NamedValues[VarName] = Variable;
+    AllocaInst* OldVal = NamedValues[VarName];
+    NamedValues[VarName] = Alloca;
 
     if (!Body->codegen())
       return nullptr;
-    // Emit the step value.
     Value *StepVal = nullptr;
-    if (Step) {
-      StepVal = Step->codegen();
-      if (!StepVal)
-        return nullptr;
+  if (Step) {
+    StepVal = Step->codegen();
+    if (!StepVal)
+      return nullptr;
     } else {
       // If not specified, use 1.0.
       StepVal = ConstantFP::get(*TheContext, APFloat(1.0));
     }
-    Value *NextVar = Builder->CreateFAdd(Variable, StepVal, "nextvar");
-    
-    // Compute the end condition.
-    Value *EndCond = End->codegen();
-    if (!EndCond)
-      return nullptr;
 
-    // Convert condition to a bool by comparing non-equal to 0.0.
-    EndCond = Builder->CreateFCmpONE(
-        EndCond, ConstantFP::get(*TheContext, APFloat(0.0)), "loopcond");
+  // Compute the end condition.
+  Value *EndCond = End->codegen();
+  if (!EndCond)
+    return nullptr;
+  // Reload, increment, and restore the alloca.  This handles the case where
+  // the body of the loop mutates the variable.
+  Value *CurVar =
+      Builder->CreateLoad(Alloca->getAllocatedType(), Alloca, VarName.c_str());
+  Value *NextVar = Builder->CreateFAdd(CurVar, StepVal, "nextvar");
+  Builder->CreateStore(NextVar, Alloca);
 
-  // Create the "after loop" block and insert it.
-  BasicBlock *LoopEndBB = Builder->GetInsertBlock();
-  BasicBlock *AfterBB =
+  EndCond = Builder->CreateFCmpONE(
+      EndCond, ConstantFP::get(*TheContext, APFloat(0.0)), "loopcond");
+
+    BasicBlock *AfterBB =
       BasicBlock::Create(*TheContext, "afterloop", TheFunction);
 
-  // Insert the conditional branch into the end of LoopEndBB.
-  Builder->CreateCondBr(EndCond, LoopBB, AfterBB);
+    Builder->CreateCondBr(EndCond, LoopBB, AfterBB);
 
-  // Any new code will be inserted in AfterBB.
-  Builder->SetInsertPoint(AfterBB);
-// Add a new entry to the PHI node for the backedge.
-  Variable->addIncoming(NextVar, LoopEndBB);
+    // Any new code will be inserted in AfterBB.
+    Builder->SetInsertPoint(AfterBB);
 
-  // Restore the unshadowed variable.
-  if (OldVal)
-    NamedValues[VarName] = OldVal;
-  else
-    NamedValues.erase(VarName);
-  
-   // for expr always returns 0.0.
-  return Constant::getNullValue(Type::getDoubleTy(*TheContext));
+    if (OldVal)
+      NamedValues[VarName] = OldVal;
+    else
+      NamedValues.erase(VarName);
+    
+    return Constant::getNullValue(Type::getDoubleTy(*TheContext));
   }
 };
 class UnaryExprAST : public ExprAST {
@@ -437,6 +454,60 @@ public:
 
   return Builder->CreateCall(F, OperandV, "unop");
 
+
+  }
+};
+
+/// VarExprAST - Expression class for var/in
+class VarExprAST : public ExprAST {
+  std::vector<std::pair<std::string, std::unique_ptr<ExprAST>>> VarNames;
+  std::unique_ptr<ExprAST> Body;
+
+public:
+  VarExprAST(std::vector<std::pair<std::string, std::unique_ptr<ExprAST>>> VarNames,
+             std::unique_ptr<ExprAST> Body)
+    : VarNames(std::move(VarNames)), Body(std::move(Body)) {}
+
+  Value *codegen() override{
+
+    std::vector<AllocaInst *> OldBindings;
+
+    Function *TheFunction = Builder->GetInsertBlock()->getParent();
+
+    for (unsigned i = 0, e = VarNames.size(); i != e; ++i){
+      const std::string &VarName = VarNames[i].first;
+      ExprAST *Init = VarNames[i].second.get();
+
+      // Emit the initializer before adding the variable to scope, this prevents
+      // the initializer from referencing the variable itself, and permits stuff
+      // like this:
+      //  var a = 1 in
+      //    var a = a in ...   # refers to outer 'a'.
+      Value *InitVal;
+      if (Init) {
+        InitVal = Init->codegen();
+        if (!InitVal)
+          return nullptr;
+      } else { // If not specified, use 0.0.
+        InitVal = ConstantFP::get(*TheContext, APFloat(0.0));
+      }
+      AllocaInst *Alloca = CreateEntryBlockAlloca(TheFunction, VarName);
+      Builder->CreateStore(InitVal, Alloca);
+
+      OldBindings.push_back(NamedValues[VarName]);
+
+      // Remember this binding.
+      NamedValues[VarName] = Alloca;
+    }
+    Value *BodyVal = Body->codegen();
+    if (!BodyVal)
+      return nullptr;
+    // Pop all our variables from scope.
+    for (unsigned i = 0, e = VarNames.size(); i != e; ++i)
+      NamedValues[VarNames[i].first] = OldBindings[i];
+
+    // Return the body computation.
+    return BodyVal;
 
   }
 };
@@ -534,41 +605,49 @@ public:
         auto &P = *Proto;
         FunctionProtos[Proto->getName()] = std::move(Proto);
         Function *TheFunction = getFunction(P.getName());
-        
-        // Function* TheFunction = TheModule->getFunction(Proto->getName());
-        // if(!TheFunction){
-        //     TheFunction = Proto->codegen();
-        // }
         if (!TheFunction)
-            return nullptr;
-        if(P.isBinaryOp())
+          return nullptr;
+        // If this is an operator, install it.
+        if (P.isBinaryOp())
           BinopPrecedence[P.getOperatorName()] = P.getBinaryPrecedence();
 
-        // if (!TheFunction->empty())
-        //     return (Function*)LogErrorV("Function cannot be redefined.");
-      
+        // Create a new basic block to start insertion into.
         BasicBlock *BB = BasicBlock::Create(*TheContext, "entry", TheFunction);
         Builder->SetInsertPoint(BB);
+
         NamedValues.clear();
-        for (auto &Arg : TheFunction->args())
-            NamedValues[std::string(Arg.getName())] = &Arg;
-      
-      if (Value *RetVal = Body->codegen()) {
+        for (auto &Arg : TheFunction->args()) {
+          // Create an alloca for this variable.
+          
+            AllocaInst *Alloca = CreateEntryBlockAlloca(TheFunction, std::string(Arg.getName()));
+
+            // Store the initial value into the alloca.
+            Builder->CreateStore(&Arg, Alloca);
+
+            // Add arguments to variable symbol table.
+            NamedValues[std::string(Arg.getName())] = Alloca;
+          }
+          if (Value *RetVal = Body->codegen()) {
             // Finish off the function.
             Builder->CreateRet(RetVal);
 
             // Validate the generated code, checking for consistency.
             verifyFunction(*TheFunction);
 
-            TheFPM->run(*TheFunction,*TheFAM);
+            // Run the optimizer on the function.
+            TheFPM->run(*TheFunction, *TheFAM);
 
             return TheFunction;
-        }  
-        // Error reading body, remove function.
-        TheFunction->eraseFromParent();
-        return nullptr;
+          }
+          // Error reading body, remove function.
+          TheFunction->eraseFromParent();
+
+          if (P.isBinaryOp())
+            BinopPrecedence.erase(P.getOperatorName());
+          return nullptr;
+
+
         
-      
       }
 
 };
@@ -672,7 +751,8 @@ static std::unique_ptr<ExprAST> ParseIdentifierExpr() {
   return std::make_unique<CallExprAST>(IdName, std::move(Args));
 }
 static std::unique_ptr<ExprAST> ParseIfExpr();
-static std::unique_ptr<ExprAST> ParseForExpr(); 
+static std::unique_ptr<ExprAST> ParseForExpr();
+static std::unique_ptr<ExprAST> ParseVarExpr(); 
 /// primary
 ///   ::= identifierexpr
 ///   ::= numberexpr
@@ -691,8 +771,11 @@ static std::unique_ptr<ExprAST> ParsePrimary() {
     return ParseIfExpr();
   case tok_for:
     return ParseForExpr();
+  case tok_var:
+    return ParseVarExpr();
   }
 }
+
 static std::unique_ptr<ExprAST> ParseUnary();
 
 /// binoprhs
@@ -934,6 +1017,52 @@ static std::unique_ptr<ExprAST> ParseForExpr() {
                                        std::move(Body));
 }
 
+static std::unique_ptr<ExprAST> ParseVarExpr(){
+
+  getNextToken(); // eat the var.
+
+  std::vector<std::pair<std::string, std::unique_ptr<ExprAST>>> VarNames;
+
+  // At least one variable name is required.
+  if (CurTok != tok_identifier)
+    return LogError("expected identifier after var");
+  
+  while (true)
+  {
+    std::string Name = IdentifierStr;
+    getNextToken(); // eat identifier.
+
+    // Read the optional initializer.
+    std::unique_ptr<ExprAST> Init = nullptr;
+    if (CurTok == '=') {
+      getNextToken(); // eat the '='.
+
+      Init = ParseExpression();
+      if (!Init)
+        return nullptr;
+    }
+    VarNames.push_back(std::make_pair(Name, std::move(Init)));
+
+    // End of var list, exit loop.
+    if (CurTok != ',')
+      break;
+    getNextToken(); // eat the ','.
+
+    if (CurTok != tok_identifier)
+      return LogError("expected identifier list after var");
+
+    }
+    // At this point, we have to have 'in'.
+    if (CurTok != tok_in)
+      return LogError("expected 'in' keyword after 'var'");
+    getNextToken(); // eat 'in'.
+
+    auto Body = ParseExpression();
+    if (!Body)
+      return nullptr;
+
+    return std::make_unique<VarExprAST>(std::move(VarNames), std::move(Body));
+}
 //===----------------------------------------------------------------------===//
 // Top-Level parsing
 //===----------------------------------------------------------------------===//
@@ -1051,6 +1180,8 @@ int main() {
 
   // Install standard binary operators.
   // 1 is lowest precedence.
+
+  BinopPrecedence['='] = 2;
   BinopPrecedence['<'] = 10;
   BinopPrecedence['+'] = 20;
   BinopPrecedence['-'] = 20;

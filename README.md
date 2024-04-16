@@ -11,7 +11,33 @@ cd Learn-LLVM
 chmod +x run.sh
 ./run.sh
 ```
+##### ch7 completed
+```
+ready> extern printd(x);
+ready> Read extern: declare double @printd(double)
 
+ready> def binary : 1 (x y) y;
+ready> Read function definition:define double @"binary:"(double %x, double %y) {
+entry:
+  ret double %y
+}
+
+ready> def test(x) printd(x) : x =4 : printd(x);
+ready> Read function definition:define double @test(double %x) {
+entry:
+  %calltmp = call double @printd(double %x)
+  %binop = call double @"binary:"(double %calltmp, double 4.000000e+00)
+  %calltmp4 = call double @printd(double 4.000000e+00)
+  %binop5 = call double @"binary:"(double %binop, double %calltmp4)
+  ret double %binop5
+}
+
+ready> test(123);
+ready> 123.000000
+4.000000
+Evaluated to 0.000000
+ready> 
+```
 ##### ch5 completed
 ```
 ready> extern putchard(char);
