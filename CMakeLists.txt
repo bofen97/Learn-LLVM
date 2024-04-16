@@ -27,4 +27,13 @@ endif()
 add_executable (toy
   toy.cpp
 )
-target_link_libraries(toy PRIVATE ${llvm_libs})
+# foreach(target ${LLVM_TARGETS_TO_BUILD})
+#   list(APPEND targets "LLVM${target}CodeGen")
+# endforeach()
+
+# foreach(target ${LLVM_TARGETS_TO_BUILD})
+#   list(APPEND targetsparser "LLVM${target}AsmParser")
+# endforeach()
+
+
+target_link_libraries(toy PRIVATE ${llvm_libs} )
