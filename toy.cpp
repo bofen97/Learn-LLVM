@@ -58,7 +58,8 @@ enum Token {
   tok_for = -9,
   tok_in = -10,
   tok_binary = -11,
-  tok_unary = -12
+  tok_unary = -12,
+  tok_var = -13
 };
 
 static std::string IdentifierStr; // Filled in if tok_identifier
@@ -95,7 +96,8 @@ static int gettok() {
       return tok_binary;
     if (IdentifierStr == "unary")
       return tok_unary;
-    
+    if (IdentifierStr == "var")
+      return tok_var;
     return tok_identifier;
   }
 
@@ -217,6 +219,7 @@ class VariableExprAST : public ExprAST {
 
 public:
   VariableExprAST(const std::string &Name) : Name(Name) {}
+  const std::string &getName() const { return Name; }
  Value* codegen() override {
     AllocaInst *A = NamedValues[Name];
     if (!A)
@@ -240,35 +243,50 @@ public:
       
       Value* codegen() override {
 
+        if (Op == '=') {
+          // Assignment requires the LHS to be an identifier.
+          // This assume we're building without RTTI because LLVM builds that way by
+          // default.  If you build LLVM with RTTI this can be changed to a
+          // dynamic_cast for automatic error checking.
+          VariableExprAST *LHSE = static_cast<VariableExprAST *>(LHS.get());
+          if (!LHSE)
+            return LogErrorV("destination of '=' must be a variable");
+          // Codegen the RHS.
+          Value *Val = RHS->codegen();
+          if (!Val)
+            return nullptr;
+
+          // Look up the name.
+          Value *Variable = NamedValues[LHSE->getName()];
+          if (!Variable)
+            return LogErrorV("Unknown variable name");
+
+          Builder->CreateStore(Val, Variable);
+          return Val;
+        }
         Value *L = LHS->codegen();
         Value *R = RHS->codegen();
         if (!L || !R)
-            return nullptr;
-        switch (Op)
-        {
-        case '+':
-            return Builder->CreateFAdd(L,R,"addtmp");
-            
-        case '-':
-            return Builder->CreateFSub(L,R,"subtmp");
-            
-        case '*':
-            return Builder->CreateFMul(L,R,"multmp");
-            
-        case '<':
-            L = Builder->CreateFCmpULT(L,R,"cmptmp");
-            //[bug] CH3 "TheContext" fix to -> "*TheContext" 
-            return Builder->CreateUIToFP(L, Type::getDoubleTy(*TheContext),
-                                 "booltmp");
-        default:
-            // return LogErrorV("invalid binary operator");
-            break;
+          return nullptr;
+        
+        switch (Op) {
+            case '+':
+              return Builder->CreateFAdd(L, R, "addtmp");
+            case '-':
+              return Builder->CreateFSub(L, R, "subtmp");
+            case '*':
+              return Builder->CreateFMul(L, R, "multmp");
+            case '<':
+              L = Builder->CreateFCmpULT(L, R, "cmptmp");
+              // Convert bool 0/1 to double 0.0 or 1.0
+              return Builder->CreateUIToFP(L, Type::getDoubleTy(*TheContext), "booltmp");
+            default:
+              break;
         }
-
         Function *F = getFunction(std::string("binary") + Op);
         assert(F && "binary operator not found!");
 
-        Value *Ops[2] = { L, R };
+        Value *Ops[] = {L, R};
         return Builder->CreateCall(F, Ops, "binop");
         
       }
@@ -355,7 +373,6 @@ public:
              std::unique_ptr<ExprAST> Body)
     : VarName(VarName), Start(std::move(Start)), End(std::move(End)),
       Step(std::move(Step)), Body(std::move(Body)) {}
-  //TODO
   Value *codegen() override{
     Function *TheFunction = Builder->GetInsertBlock()->getParent();
 
@@ -437,6 +454,60 @@ public:
 
   return Builder->CreateCall(F, OperandV, "unop");
 
+
+  }
+};
+
+/// VarExprAST - Expression class for var/in
+class VarExprAST : public ExprAST {
+  std::vector<std::pair<std::string, std::unique_ptr<ExprAST>>> VarNames;
+  std::unique_ptr<ExprAST> Body;
+
+public:
+  VarExprAST(std::vector<std::pair<std::string, std::unique_ptr<ExprAST>>> VarNames,
+             std::unique_ptr<ExprAST> Body)
+    : VarNames(std::move(VarNames)), Body(std::move(Body)) {}
+
+  Value *codegen() override{
+
+    std::vector<AllocaInst *> OldBindings;
+
+    Function *TheFunction = Builder->GetInsertBlock()->getParent();
+
+    for (unsigned i = 0, e = VarNames.size(); i != e; ++i){
+      const std::string &VarName = VarNames[i].first;
+      ExprAST *Init = VarNames[i].second.get();
+
+      // Emit the initializer before adding the variable to scope, this prevents
+      // the initializer from referencing the variable itself, and permits stuff
+      // like this:
+      //  var a = 1 in
+      //    var a = a in ...   # refers to outer 'a'.
+      Value *InitVal;
+      if (Init) {
+        InitVal = Init->codegen();
+        if (!InitVal)
+          return nullptr;
+      } else { // If not specified, use 0.0.
+        InitVal = ConstantFP::get(*TheContext, APFloat(0.0));
+      }
+      AllocaInst *Alloca = CreateEntryBlockAlloca(TheFunction, VarName);
+      Builder->CreateStore(InitVal, Alloca);
+
+      OldBindings.push_back(NamedValues[VarName]);
+
+      // Remember this binding.
+      NamedValues[VarName] = Alloca;
+    }
+    Value *BodyVal = Body->codegen();
+    if (!BodyVal)
+      return nullptr;
+    // Pop all our variables from scope.
+    for (unsigned i = 0, e = VarNames.size(); i != e; ++i)
+      NamedValues[VarNames[i].first] = OldBindings[i];
+
+    // Return the body computation.
+    return BodyVal;
 
   }
 };
@@ -680,7 +751,8 @@ static std::unique_ptr<ExprAST> ParseIdentifierExpr() {
   return std::make_unique<CallExprAST>(IdName, std::move(Args));
 }
 static std::unique_ptr<ExprAST> ParseIfExpr();
-static std::unique_ptr<ExprAST> ParseForExpr(); 
+static std::unique_ptr<ExprAST> ParseForExpr();
+static std::unique_ptr<ExprAST> ParseVarExpr(); 
 /// primary
 ///   ::= identifierexpr
 ///   ::= numberexpr
@@ -699,8 +771,11 @@ static std::unique_ptr<ExprAST> ParsePrimary() {
     return ParseIfExpr();
   case tok_for:
     return ParseForExpr();
+  case tok_var:
+    return ParseVarExpr();
   }
 }
+
 static std::unique_ptr<ExprAST> ParseUnary();
 
 /// binoprhs
@@ -942,6 +1017,52 @@ static std::unique_ptr<ExprAST> ParseForExpr() {
                                        std::move(Body));
 }
 
+static std::unique_ptr<ExprAST> ParseVarExpr(){
+
+  getNextToken(); // eat the var.
+
+  std::vector<std::pair<std::string, std::unique_ptr<ExprAST>>> VarNames;
+
+  // At least one variable name is required.
+  if (CurTok != tok_identifier)
+    return LogError("expected identifier after var");
+  
+  while (true)
+  {
+    std::string Name = IdentifierStr;
+    getNextToken(); // eat identifier.
+
+    // Read the optional initializer.
+    std::unique_ptr<ExprAST> Init = nullptr;
+    if (CurTok == '=') {
+      getNextToken(); // eat the '='.
+
+      Init = ParseExpression();
+      if (!Init)
+        return nullptr;
+    }
+    VarNames.push_back(std::make_pair(Name, std::move(Init)));
+
+    // End of var list, exit loop.
+    if (CurTok != ',')
+      break;
+    getNextToken(); // eat the ','.
+
+    if (CurTok != tok_identifier)
+      return LogError("expected identifier list after var");
+
+    }
+    // At this point, we have to have 'in'.
+    if (CurTok != tok_in)
+      return LogError("expected 'in' keyword after 'var'");
+    getNextToken(); // eat 'in'.
+
+    auto Body = ParseExpression();
+    if (!Body)
+      return nullptr;
+
+    return std::make_unique<VarExprAST>(std::move(VarNames), std::move(Body));
+}
 //===----------------------------------------------------------------------===//
 // Top-Level parsing
 //===----------------------------------------------------------------------===//
@@ -1059,6 +1180,8 @@ int main() {
 
   // Install standard binary operators.
   // 1 is lowest precedence.
+
+  BinopPrecedence['='] = 2;
   BinopPrecedence['<'] = 10;
   BinopPrecedence['+'] = 20;
   BinopPrecedence['-'] = 20;
