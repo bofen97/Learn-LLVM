@@ -1,3 +1,4 @@
+// I am Binary psychedelic mushrooms
 #include "jit.h"
 #include "llvm/ADT/APFloat.h"
 #include "llvm/ADT/STLExtras.h"
@@ -137,7 +138,7 @@ namespace {
 static std::unique_ptr<LLVMContext> TheContext;
 static std::unique_ptr<Module> TheModule;
 static std::unique_ptr<IRBuilder<>> Builder;
-static std::map<std::string, Value *> NamedValues;
+static std::map<std::string, AllocaInst *> NamedValues;
 static std::unique_ptr<FunctionPassManager> TheFPM;
 static std::unique_ptr<LoopAnalysisManager> TheLAM;
 static std::unique_ptr<FunctionAnalysisManager> TheFAM;
@@ -148,6 +149,15 @@ static std::unique_ptr<StandardInstrumentations> TheSI;
 static std::unique_ptr<KaleidoscopeJIT> TheJIT;
 static ExitOnError ExitOnErr;
 
+/// CreateEntryBlockAlloca - Create an alloca instruction in the entry block of
+/// the function.  This is used for mutable variables etc.
+static AllocaInst *CreateEntryBlockAlloca(Function *TheFunction,
+                                           const std::string &VarName) {
+  IRBuilder<> TmpB(&TheFunction->getEntryBlock(),
+                 TheFunction->getEntryBlock().begin());
+  return TmpB.CreateAlloca(Type::getDoubleTy(*TheContext), nullptr,
+                           VarName);
+}
 
 static void InitializeModuleAndPassManager(){
 
@@ -208,12 +218,12 @@ class VariableExprAST : public ExprAST {
 public:
   VariableExprAST(const std::string &Name) : Name(Name) {}
  Value* codegen() override {
-    Value *V = NamedValues[Name];
-    if (!V)
+    AllocaInst *A = NamedValues[Name];
+    if (!A)
     {
         LogErrorV("Unknown variable name");
     }
-    return V;
+    return Builder->CreateLoad(A->getAllocatedType(), A, Name.c_str());
     
  }
 };
@@ -345,76 +355,66 @@ public:
              std::unique_ptr<ExprAST> Body)
     : VarName(VarName), Start(std::move(Start)), End(std::move(End)),
       Step(std::move(Step)), Body(std::move(Body)) {}
-
+  //TODO
   Value *codegen() override{
-
-    Value *StartVal = Start->codegen();
-    if(!StartVal){
-      return nullptr;
-    }
     Function *TheFunction = Builder->GetInsertBlock()->getParent();
-    BasicBlock *PreheaderBB = Builder->GetInsertBlock();
-    BasicBlock *LoopBB =
-        BasicBlock::Create(*TheContext, "loop", TheFunction);
 
-    // Insert an explicit fall through from the current block to the LoopBB.
+    // Create an alloca for the variable in the entry block.
+    AllocaInst *Alloca = CreateEntryBlockAlloca(TheFunction, VarName);
+
+    // Emit the start code first, without 'variable' in scope.
+    Value *StartVal = Start->codegen();
+    if (!StartVal)
+      return nullptr;
+    
+    Builder->CreateStore(StartVal,Alloca);
+    BasicBlock* LoopBB = BasicBlock::Create(*TheContext,"loop",TheFunction);
     Builder->CreateBr(LoopBB);
-
     Builder->SetInsertPoint(LoopBB);
-    // Start the PHI node with an entry for Start.
-    PHINode *Variable = Builder->CreatePHI(Type::getDoubleTy(*TheContext),
-                                       2, VarName);
-    Variable->addIncoming(StartVal, PreheaderBB);
 
-    // Within the loop, the variable is defined equal to the PHI node.  If it
-    // shadows an existing variable, we have to restore it, so save it now.
-    Value *OldVal = NamedValues[VarName];
-    NamedValues[VarName] = Variable;
+    AllocaInst* OldVal = NamedValues[VarName];
+    NamedValues[VarName] = Alloca;
 
     if (!Body->codegen())
       return nullptr;
-    // Emit the step value.
     Value *StepVal = nullptr;
-    if (Step) {
-      StepVal = Step->codegen();
-      if (!StepVal)
-        return nullptr;
+  if (Step) {
+    StepVal = Step->codegen();
+    if (!StepVal)
+      return nullptr;
     } else {
       // If not specified, use 1.0.
       StepVal = ConstantFP::get(*TheContext, APFloat(1.0));
     }
-    Value *NextVar = Builder->CreateFAdd(Variable, StepVal, "nextvar");
-    
-    // Compute the end condition.
-    Value *EndCond = End->codegen();
-    if (!EndCond)
-      return nullptr;
 
-    // Convert condition to a bool by comparing non-equal to 0.0.
-    EndCond = Builder->CreateFCmpONE(
-        EndCond, ConstantFP::get(*TheContext, APFloat(0.0)), "loopcond");
+  // Compute the end condition.
+  Value *EndCond = End->codegen();
+  if (!EndCond)
+    return nullptr;
+  // Reload, increment, and restore the alloca.  This handles the case where
+  // the body of the loop mutates the variable.
+  Value *CurVar =
+      Builder->CreateLoad(Alloca->getAllocatedType(), Alloca, VarName.c_str());
+  Value *NextVar = Builder->CreateFAdd(CurVar, StepVal, "nextvar");
+  Builder->CreateStore(NextVar, Alloca);
 
-  // Create the "after loop" block and insert it.
-  BasicBlock *LoopEndBB = Builder->GetInsertBlock();
-  BasicBlock *AfterBB =
+  EndCond = Builder->CreateFCmpONE(
+      EndCond, ConstantFP::get(*TheContext, APFloat(0.0)), "loopcond");
+
+    BasicBlock *AfterBB =
       BasicBlock::Create(*TheContext, "afterloop", TheFunction);
 
-  // Insert the conditional branch into the end of LoopEndBB.
-  Builder->CreateCondBr(EndCond, LoopBB, AfterBB);
+    Builder->CreateCondBr(EndCond, LoopBB, AfterBB);
 
-  // Any new code will be inserted in AfterBB.
-  Builder->SetInsertPoint(AfterBB);
-// Add a new entry to the PHI node for the backedge.
-  Variable->addIncoming(NextVar, LoopEndBB);
+    // Any new code will be inserted in AfterBB.
+    Builder->SetInsertPoint(AfterBB);
 
-  // Restore the unshadowed variable.
-  if (OldVal)
-    NamedValues[VarName] = OldVal;
-  else
-    NamedValues.erase(VarName);
-  
-   // for expr always returns 0.0.
-  return Constant::getNullValue(Type::getDoubleTy(*TheContext));
+    if (OldVal)
+      NamedValues[VarName] = OldVal;
+    else
+      NamedValues.erase(VarName);
+    
+    return Constant::getNullValue(Type::getDoubleTy(*TheContext));
   }
 };
 class UnaryExprAST : public ExprAST {
@@ -534,41 +534,49 @@ public:
         auto &P = *Proto;
         FunctionProtos[Proto->getName()] = std::move(Proto);
         Function *TheFunction = getFunction(P.getName());
-        
-        // Function* TheFunction = TheModule->getFunction(Proto->getName());
-        // if(!TheFunction){
-        //     TheFunction = Proto->codegen();
-        // }
         if (!TheFunction)
-            return nullptr;
-        if(P.isBinaryOp())
+          return nullptr;
+        // If this is an operator, install it.
+        if (P.isBinaryOp())
           BinopPrecedence[P.getOperatorName()] = P.getBinaryPrecedence();
 
-        // if (!TheFunction->empty())
-        //     return (Function*)LogErrorV("Function cannot be redefined.");
-      
+        // Create a new basic block to start insertion into.
         BasicBlock *BB = BasicBlock::Create(*TheContext, "entry", TheFunction);
         Builder->SetInsertPoint(BB);
+
         NamedValues.clear();
-        for (auto &Arg : TheFunction->args())
-            NamedValues[std::string(Arg.getName())] = &Arg;
-      
-      if (Value *RetVal = Body->codegen()) {
+        for (auto &Arg : TheFunction->args()) {
+          // Create an alloca for this variable.
+          
+            AllocaInst *Alloca = CreateEntryBlockAlloca(TheFunction, std::string(Arg.getName()));
+
+            // Store the initial value into the alloca.
+            Builder->CreateStore(&Arg, Alloca);
+
+            // Add arguments to variable symbol table.
+            NamedValues[std::string(Arg.getName())] = Alloca;
+          }
+          if (Value *RetVal = Body->codegen()) {
             // Finish off the function.
             Builder->CreateRet(RetVal);
 
             // Validate the generated code, checking for consistency.
             verifyFunction(*TheFunction);
 
-            TheFPM->run(*TheFunction,*TheFAM);
+            // Run the optimizer on the function.
+            TheFPM->run(*TheFunction, *TheFAM);
 
             return TheFunction;
-        }  
-        // Error reading body, remove function.
-        TheFunction->eraseFromParent();
-        return nullptr;
+          }
+          // Error reading body, remove function.
+          TheFunction->eraseFromParent();
+
+          if (P.isBinaryOp())
+            BinopPrecedence.erase(P.getOperatorName());
+          return nullptr;
+
+
         
-      
       }
 
 };
